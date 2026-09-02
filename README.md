@@ -1,104 +1,273 @@
-# TokenBucketRateLimiter
+# Distributed API Rate Limiter — Spring Boot, Redis & Lua
 
-A Spring Boot 3.5.16 application that demonstrates a custom token bucket rate limiter backed by Redis and implemented with a Lua script.
+### Overview
 
-## What it does
+Designed and implemented a **production-oriented API Rate Limiting system** using **Spring Boot 3.5, Redis, and Lua scripting** to protect APIs from excessive traffic, abuse, and resource exhaustion.
 
-This project provides two rate-limiting approaches:
+The system implements the **Token Bucket algorithm** and supports two complementary rate-limiting strategies:
 
-- **Annotation-based rate limiting** for specific controller methods using `@RateLimit`
-- **IP-based request limiting** applied to all routes through a Spring MVC interceptor
+* **Method-level rate limiting** using a custom `@RateLimit` annotation and Spring AOP.
+* **Global IP-based rate limiting** using a Spring MVC `HandlerInterceptor`.
 
-It uses Redis to store token bucket state and a Lua script to perform atomic token consumption and refill logic.
+Redis acts as the distributed state store, while a **Lua script performs token refill and consumption atomically**, preventing race conditions when multiple requests access the same bucket concurrently.
 
-## Features
+---
 
-- Token bucket algorithm powered by Redis Lua scripting
-- Method-level rate limiting with a custom annotation
-- Global IP-based request throttling
-- `429 Too Many Requests` responses when limits are exceeded
-- Remaining-token information returned in response headers for IP-limited requests
-- Spring Boot AOP integration
+## 🚀 Key Engineering Highlights
 
-## How it works
+### 1. Redis-backed Token Bucket Algorithm
 
-### 1. Method-level rate limiting
+Implemented a token bucket where each client has:
 
-The custom annotation `@RateLimit` can be placed on controller methods. An aspect intercepts the call, resolves the user identity from the `X-USER-ID` header or client IP address, and consumes tokens from a Redis-backed bucket keyed by user and endpoint.
+* A configurable maximum bucket capacity.
+* A configurable token refill rate.
+* Tokens consumed for every accepted request.
+* Automatic token regeneration based on elapsed time.
 
-Example from the repo:
+For example:
 
-- `POST /api/orders` → `@RateLimit(capacity = 5, refillRate = 1)`
-- `GET /api/orders` → `@RateLimit(capacity = 50, refillRate = 10)`
+```text
+POST /api/orders
+Capacity   : 5 tokens
+Refill     : 1 token/second
 
-### 2. IP-based limiting
-
-A `HandlerInterceptor` runs for all requests and applies a fixed limit per client IP:
-
-- Capacity: `100`
-- Refill rate: `20 tokens/second`
-
-If the limit is exceeded, the API responds with:
-
-- HTTP status `429`
-- JSON body: `{"error": "Too Many Requests"}`
-
-## Project structure
-
-- `src/main/java/com/custom_rate_limiter/annotation/RateLimit.java` — custom rate-limit annotation
-- `src/main/java/com/custom_rate_limiter/aspect/RateLimitAspect.java` — method-level enforcement
-- `src/main/java/com/custom_rate_limiter/interceptor/IpRateLimitInterceptor.java` — IP-based enforcement
-- `src/main/java/com/custom_rate_limiter/service/RateLimiterService.java` — Redis/Lua token consumption logic
-- `src/main/java/com/custom_rate_limiter/config/RedisConfig.java` — Lua script configuration
-- `src/main/java/com/custom_rate_limiter/config/WebConfig.java` — interceptor registration
-- `src/main/java/com/custom_rate_limiter/controller/OrderController.java` — sample protected endpoints
-- `src/main/resources/scripts/token_bucket.lua` — token bucket implementation
-
-## Requirements
-
-- Java 21
-- Maven
-- Redis
-
-## Running the application
-
-1. Start Redis locally.
-2. Build the project:
-
-```bash
-mvn clean install
+GET /api/orders
+Capacity   : 50 tokens
+Refill     : 10 tokens/second
 ```
 
-3. Run the application:
+This allows different APIs to have different traffic policies instead of applying a single global limit.
 
-```bash
-mvn spring-boot:run
+---
+
+### 2. Atomic Rate Limiting with Redis Lua
+
+The critical part of the implementation is the Redis Lua script.
+
+A request can involve multiple operations:
+
+```text
+Read bucket state
+      ↓
+Calculate elapsed time
+      ↓
+Refill tokens
+      ↓
+Check availability
+      ↓
+Consume token
+      ↓
+Update Redis state
 ```
 
-## Example usage
+Performing these operations independently could introduce race conditions when multiple requests arrive simultaneously.
 
-### Create an order
+The project solves this by executing the complete token-bucket operation inside **one Redis Lua script**, making the state transition atomic.
 
-```bash
-curl -X POST http://localhost:8080/api/orders \
-  -H "Content-Type: application/json" \
-  -H "X-USER-ID: user-123" \
-  -d '{"item":"Keyboard"}'
+Conceptually:
+
+```text
+Request
+   ↓
+Redis
+   ↓
+Lua Script
+   ├── Read tokens + timestamp
+   ├── Calculate refill
+   ├── Check token availability
+   ├── Consume token
+   └── Store updated state
+   ↓
+Allowed / Rejected
 ```
 
-### Get orders
+This makes the implementation suitable for concurrent requests and horizontally scaled application instances sharing the same Redis state.
 
-```bash
-curl http://localhost:8080/api/orders \
-  -H "X-USER-ID: user-123"
+---
+
+## ⚡ Method-Level Rate Limiting
+
+Implemented a custom annotation:
+
+```java
+@RateLimit(capacity = 5, refillRate = 1)
 ```
 
-## Notes
+The corresponding Spring AOP aspect intercepts annotated controller methods and determines the request identity using:
 
-- If `X-USER-ID` is not provided, the system falls back to the client IP address.
-- The Redis Lua script keeps token bucket updates atomic.
-- This repository currently includes a basic sample controller (`OrderController`) to demonstrate the limiter behavior.
+```text
+X-USER-ID
+     ↓
+If unavailable
+     ↓
+Client IP
+```
 
-## License
+The bucket is then associated with the client and endpoint, allowing different APIs to maintain independent limits.
 
-No license file was present in the repository at the time this README was generated.
+Example:
+
+```text
+user-123 + POST /api/orders
+              ↓
+Redis Bucket
+              ↓
+5 capacity / 1 refill per second
+```
+
+This demonstrates practical usage of **custom annotations, Spring AOP, request interception, and cross-cutting concerns**.
+
+---
+
+## 🌐 Global IP-Based Rate Limiting
+
+Implemented a Spring MVC `HandlerInterceptor` to protect all application routes with a global IP-based limit.
+
+Default policy:
+
+```text
+Bucket Capacity : 100
+Refill Rate     : 20 tokens/second
+```
+
+The interceptor executes before the controller and prevents excessive requests from reaching the business layer.
+
+When the bucket is exhausted:
+
+```http
+HTTP/1.1 429 Too Many Requests
+```
+
+Response:
+
+```json
+{
+  "error": "Too Many Requests"
+}
+```
+
+For accepted requests, the API also exposes **remaining-token information through response headers**, making the limiter observable to API clients.
+
+---
+
+## 🧠 Why This Project Matters
+
+Traditional applications often allow every incoming request to reach the controller and database.
+
+Under excessive traffic:
+
+```text
+Thousands of Requests
+        ↓
+Application Threads
+        ↓
+Business Logic
+        ↓
+Database / External APIs
+        ↓
+Resource Exhaustion
+```
+
+The rate limiter introduces a control layer:
+
+```text
+Incoming Request
+        ↓
+Rate Limiter
+        ↓
+ ┌──────┴──────┐
+ ↓             ↓
+Allowed       Rejected
+ ↓             ↓
+Controller     429
+```
+
+This protects backend resources and provides a foundation for building **resilient and scalable APIs**.
+
+---
+
+## 🏗️ Architecture
+
+```text
+                    Client
+                      │
+                      ▼
+              Spring Boot API
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+          ▼                       ▼
+   IP Rate Limiter          @RateLimit
+   Interceptor                  AOP
+          │                       │
+          └───────────┬───────────┘
+                      ▼
+              RateLimiterService
+                      │
+                      ▼
+                   Redis
+                      │
+                      ▼
+                Lua Script
+                      │
+          ┌───────────┴───────────┐
+          ▼                       ▼
+      Allowed                   Rejected
+          │                       │
+          ▼                       ▼
+     Controller             HTTP 429
+```
+
+---
+
+## 🛠️ Technology Stack
+
+**Backend**
+
+* Java 21
+* Spring Boot 3.5
+* Spring MVC
+* Spring AOP
+
+**Distributed State & Rate Limiting**
+
+* Redis
+* Redis Lua scripting
+* Token Bucket algorithm
+
+**Build & Infrastructure**
+
+* Maven
+
+---
+
+## 📌 Core Concepts Demonstrated
+
+This project demonstrates practical understanding of:
+
+* API Rate Limiting
+* Token Bucket Algorithm
+* Redis
+* Redis Lua Scripting
+* Atomic operations
+* Race-condition prevention
+* Concurrent request handling
+* Spring AOP
+* Custom Java annotations
+* Spring MVC Interceptors
+* HTTP `429 Too Many Requests`
+* Distributed application state
+* API resource protection
+* Configurable traffic policies
+
+---
+
+## 💡 Engineering Takeaway
+
+The major learning from this project was that **rate limiting is not simply checking a counter**.
+
+In a concurrent/distributed environment, the challenge is maintaining **correct shared state while multiple requests are modifying it simultaneously**.
+
+Using Redis as the shared state store and Lua to perform the complete token-bucket operation atomically provides a much more reliable design than maintaining rate-limit state inside an individual application instance.
+
+This project therefore focuses not only on implementing a feature, but on understanding **concurrency, distributed state, atomicity, and backend resilience**.
